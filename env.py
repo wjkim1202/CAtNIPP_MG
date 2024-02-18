@@ -1,5 +1,5 @@
 import os
-import copy
+import copy, pdb
 import numpy as np
 from itertools import product
 from classes import PRMController, Obstacle, Utils
@@ -7,11 +7,14 @@ from classes.Gaussian2D import Gaussian2D
 from matplotlib import pyplot as plt
 from gp_ipp import GaussianProcessForIPP
 from parameters import ADAPTIVE_AREA
+from parameters import RESET_EVERY_EPISODE
 
 
 
 class Env():
-    def __init__(self, sample_size=500, k_size=10, start=None, destination=None, obstacle=[], budget_range=None, save_image=False, seed=None):
+    def __init__(self, sample_size=500, k_size=10, start=None, destination=None, obstacle=[], budget_range=None, save_image=False, seed=None, fixed_env=None):
+        self.fixed_env = fixed_env
+
         self.sample_size = sample_size
         self.k_size = k_size
         self.budget_range = budget_range
@@ -20,13 +23,26 @@ class Env():
             self.start = np.random.rand(1, 2)
         else:
             self.start = np.array([start])
+            if fixed_env == 1:
+                self.start = np.array([0.8, 0.8])
+            elif fixed_env == 2:
+                self.start = np.array([0., 0.])
+
         if destination is None:
             self.destination = np.random.rand(1, 2)
         else:
             self.destination = np.array([destination])
+
+        if self.fixed_env == 1:
+            self.destination = np.array([0.7, 0.7])
+        elif fixed_env == 2:
+            self.destination = np.array([1, 0.])
+
         self.obstacle = obstacle
         self.seed = seed
-        
+
+
+        # print("env -- start : ", self.start, " -- desti: ", self.destination)
         # generate PRM
         # self.prm = None
         # self.node_coords, self.graph = None, None
@@ -36,7 +52,34 @@ class Env():
                                  self.k_size)
         self.budget = np.random.uniform(*self.budget_range)
         self.node_coords, self.graph = self.prm.runPRM(saveImage=False, seed=seed)
-        
+
+        edge_length = []
+        for key in self.graph:
+            for key2 in self.graph[key]:
+                edge_length.append(self.graph[key][key2].length)
+        edge_length = np.array(edge_length)
+        avg_edge_length = np.mean(edge_length)
+        std_edge_length = np.std(edge_length)
+
+        effective_horizon = self.budget/avg_edge_length
+        effective_gamma = (0.001)**(1/effective_horizon)
+        # effective_horizon2 = (0.1)**(1/avg_timestep_budget)
+
+        self.effective_horizon = effective_horizon
+        self.effective_gamma = effective_gamma
+
+        # budget_candidate = [0.1, 0.5, 1, 1.5, 2, 4, 6, 8, 10, 12]
+        # for bud in budget_candidate:
+        #     avg_timestep_budget = bud/avg_edge_length
+        #     effective_horizon = (0.01)**(1/avg_timestep_budget)
+        #     effective_horizon2 = (0.1)**(1/avg_timestep_budget)
+        #     effective_horizon3 = (0.001)**(1/avg_timestep_budget)
+
+        #     print("budget : ", bud , "  avg_timestep_budget : ", avg_timestep_budget)
+        #     print("avg_edge_length : ", avg_edge_length, "  std_edge_length : ", std_edge_length)
+        #     print("effective_horizon-0.001: ", effective_horizon3, "  effective_horizon-0.01: ", effective_horizon, "   for 0.1: ", effective_horizon2)
+        #     print("#####################################################")
+
         # underlying distribution
         self.underlying_distribution = None
         self.ground_truth = None
@@ -63,24 +106,41 @@ class Env():
 
     def reset(self, seed=None):
         # generate PRM
-        # self.start = np.random.rand(1, 2)
-        # self.destination = np.random.rand(1, 2)
-        # self.prm = PRMController(self.sample_size, self.obstacle, self.start, self.destination, self.budget_range, self.k_size)
-        # self.budget = np.random.uniform(*self.budget_range)
-        # self.node_coords, self.graph = self.prm.runPRM(saveImage=False)
+        if RESET_EVERY_EPISODE:
+            self.start = np.random.rand(1, 2)
+            self.destination = np.random.rand(1, 2)
+            self.prm = PRMController(self.sample_size, self.obstacle, self.start, self.destination, self.budget_range, self.k_size)
+            self.budget = np.random.uniform(*self.budget_range)
+            self.node_coords, self.graph = self.prm.runPRM(saveImage=False)
+            
+
         if seed:
             np.random.seed(seed)
         else:
             np.random.seed(self.seed)
 
         # underlying distribution
-        self.underlying_distribution = Gaussian2D()
+        
+        if self.fixed_env == 1:
+            self.underlying_distribution = Gaussian2D(fixed_env=self.fixed_env)
+        else:
+            self.underlying_distribution = Gaussian2D()
         self.ground_truth = self.get_ground_truth()
+
+        # self.underlying_distribution.plot(self.ground_truth)
+
+
+        # print("Gaussian2D : ", self.underlying_distribution)
+        # print("self.ground_truth : ", self.ground_truth)
+        # pdb.set_trace()
 
         # initialize gp
         self.gp_ipp = GaussianProcessForIPP(self.node_coords)
         self.high_info_area = self.gp_ipp.get_high_info_area() if ADAPTIVE_AREA else None
         self.node_info, self.node_std = self.gp_ipp.update_node()
+
+        # print("self.node_coords : ", self.node_coords)
+        # pdb.set_trace()
         
         # initialize evaluations
         #self.F1score = self.gp_ipp.evaluate_F1score(self.ground_truth)
@@ -99,6 +159,8 @@ class Env():
         self.route = []
         np.random.seed(None)
 
+        self.cov_trace_vec = None
+
         return self.node_coords, self.graph, self.node_info, self.node_std, self.budget
 
     def step(self, next_node_index, sample_length, measurement=True):
@@ -108,7 +170,9 @@ class Env():
         reward = 0
         done = True if next_node_index == 0 else False
         no_sample = True
+        count = 0
         while remain_length > next_length:
+            count += 1
             if no_sample:
                 self.sample = (self.node_coords[next_node_index] - self.node_coords[
                     self.current_node_index]) * next_length / dist + self.node_coords[self.current_node_index]
@@ -134,25 +198,28 @@ class Env():
         #F1score = self.gp_ipp.evaluate_F1score(self.ground_truth)
             RMSE = self.gp_ipp.evaluate_RMSE(self.ground_truth)
             self.RMSE = RMSE
-        cov_trace = self.gp_ipp.evaluate_cov_trace(self.high_info_area)
+        cov_trace, cov_trace_vec  = self.gp_ipp.evaluate_cov_trace(self.high_info_area, ver = 1)
         #self.F1score = F1score
         if next_node_index in self.route[-2:]:
             reward += -0.1
-
+        
         elif self.cov_trace > cov_trace:
             reward += (self.cov_trace - cov_trace) / self.cov_trace
         self.cov_trace = cov_trace
 
+        self.cov_trace_vec = cov_trace_vec
+
+
         if done:
             reward -= cov_trace/900
-
+        
         self.dist_residual = self.dist_residual + remain_length if no_sample else remain_length
         self.budget -= dist
         self.current_node_index = next_node_index
         self.route.append(next_node_index)
         assert self.budget >= 0  # Dijsktra filter
          
-        return reward, done, self.node_info, self.node_std, self.budget
+        return reward, done, self.node_info, self.node_std, self.budget, self.effective_gamma
 
     def route_step(self, route, sample_length, measurement=True):
         current_node = route[0]

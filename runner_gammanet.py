@@ -3,7 +3,7 @@ import numpy as np
 import ray
 import os
 from attention_net import AttentionNet
-from worker import Worker
+from worker_gammanet import Worker
 from parameters import *
 
 
@@ -14,7 +14,7 @@ class Runner(object):
     def __init__(self, metaAgentID):
         self.metaAgentID = metaAgentID
         self.device = torch.device('cuda') if USE_GPU else torch.device('cpu')
-        self.localNetwork = AttentionNet(INPUT_DIM, EMBEDDING_DIM, multigamma=MULTI_GAMMA)
+        self.localNetwork = AttentionNet(INPUT_DIM, EMBEDDING_DIM)
         self.localNetwork.to(self.device)
 
     def get_weights(self):

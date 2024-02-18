@@ -1,4 +1,4 @@
-import copy, pdb
+import copy
 
 import torch
 import torch.optim as optim
@@ -12,8 +12,9 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from torch.cuda.amp.autocast_mode import autocast
 
 from attention_net import AttentionNet
-from runner import RLRunner
+from runner_gammanet import RLRunner
 from parameters import *
+
 
 ray.init()
 print("Welcome to PRM-AN!")
@@ -60,8 +61,7 @@ def main():
     device = torch.device('cuda') if USE_GPU_GLOBAL else torch.device('cpu')
     local_device = torch.device('cuda') if USE_GPU else torch.device('cpu')
     
-    print("-------------------------- gamma : ", MULTI_GAMMA)
-    global_network = AttentionNet(INPUT_DIM, EMBEDDING_DIM, multigamma=MULTI_GAMMA).to(device)
+    global_network = AttentionNet(INPUT_DIM, EMBEDDING_DIM).to(device)
     # global_network.share_memory()
     global_optimizer = optim.Adam(global_network.parameters(), lr=LR)
     lr_decay = optim.lr_scheduler.StepLR(global_optimizer, step_size=DECAY_STEP, gamma=0.96)
@@ -106,11 +106,6 @@ def main():
     tensorboardData = []
     trainingData = []
     experience_buffer = []
-
-    epi_iter = 0
-    result_cov_trace = []
-    result_cov_trace_all  = []
-
     for i in range(13):
         experience_buffer.append([])
 
@@ -128,24 +123,11 @@ def main():
                 perf_metrics[n] = []
             for job in done_jobs:
                 jobResults, metrics, info = job
-                # pdb.set_trace()
                 for i in range(13):
                     experience_buffer[i] += jobResults[i]
                 for n in metric_name:
                     perf_metrics[n].append(metrics[n])
-                result_cov_trace.append(metrics['cov_trace'])
             
-            if len(result_cov_trace) >= 32: # % 36 == 0:
-                result_cov_trace_all.append(np.mean(result_cov_trace))
-                print("#################################################")
-                print("#################################################")
-                print("------epi : ", curr_episode, ' ---- cov_trace: ', np.mean(result_cov_trace))
-                print("history: ", result_cov_trace_all)
-                print("#################################################")
-                print("#################################################")
-                
-                result_cov_trace = []
-
             if np.mean(perf_metrics['cov_trace']) < best_perf and curr_episode % 32 == 0:
                 best_perf = np.mean(perf_metrics['cov_trace'])
                 print('Saving best model', end='\n')
@@ -179,7 +161,6 @@ def main():
                 action_batch = torch.stack(rollouts[3], dim=0) # (batch,1,1)
                 value_batch = torch.stack(rollouts[4], dim=0) # (batch,1,1)
                 reward_batch = torch.stack(rollouts[5], dim=0) # (batch,1,1)
-                # pdb.set_trace()
                 value_prime_batch = torch.stack(rollouts[6], dim=0) # (batch,1,1)
                 target_v_batch = torch.stack(rollouts[7])
                 budget_inputs_batch = torch.stack(rollouts[8], dim=0)
@@ -202,73 +183,40 @@ def main():
                     LSTM_c_batch = LSTM_c_batch.to(device)
                     mask_batch = mask_batch.to(device)
                     pos_encoding_batch = pos_encoding_batch.to(device)
-                
+
                 # PPO
                 with torch.no_grad():
                     logp_list, value, _, _ = global_network(node_inputs_batch, edge_inputs_batch, budget_inputs_batch, current_inputs_batch, LSTM_h_batch, LSTM_c_batch, pos_encoding_batch, mask_batch)
-                
-                entropy = 0
-                if MULTI_GAMMA is None:
-                    old_logp = torch.gather(logp_list, 1 , action_batch.squeeze(1)).unsqueeze(1) # (batch_size,1,1)
-                    advantage = (reward_batch + GAMMA*value_prime_batch - value_batch) # (batch_size, 1, 1)
-                    #advantage = target_v_batch - value_batch
-                    entropy = (logp_list*logp_list.exp()).sum(dim=-1).mean()
-                else:
-                    old_logp, advantage = [],[]
-                    for ga in range(len(MULTI_GAMMA)):
-                        old_logp_ = torch.gather(logp_list[:, ga, :], 1 , action_batch.squeeze(1)).unsqueeze(1) # (batch_size,1,1)
-                        advantage_ = (reward_batch + MULTI_GAMMA[ga]*value_prime_batch[:, :, ga].unsqueeze(-1) - value_batch[:, :, ga].unsqueeze(-1)) # (batch_size, 1, 1)
-                        #advantage = target_v_batch - value_batch
-                        entropy += (logp_list[:, ga, :]*logp_list[:, ga, :].exp()).sum(dim=-1).mean()
-                        old_logp.append(old_logp_)
-                        advantage.append(advantage_)
-                    old_logp = torch.stack(old_logp, dim=1)
-                    advantage = torch.stack(advantage, dim=-1)
+                old_logp = torch.gather(logp_list, 1 , action_batch.squeeze(1)).unsqueeze(1) # (batch_size,1,1)
+                advantage = (reward_batch + GAMMA*value_prime_batch - value_batch) # (batch_size, 1, 1)
+                #advantage = target_v_batch - value_batch
 
-                    entropy = entropy / len(MULTI_GAMMA)
-                
+                entropy = (logp_list*logp_list.exp()).sum(dim=-1).mean()
+
                 scaler = GradScaler()
 
                 for i in range(8):
                     with autocast():
                         logp_list, value, _, _ = dp_model(node_inputs_batch, edge_inputs_batch, budget_inputs_batch, current_inputs_batch, LSTM_h_batch, LSTM_c_batch, pos_encoding_batch, mask_batch)
-                        if MULTI_GAMMA is None:
-                            logp = torch.gather(logp_list, 1, action_batch.squeeze(1)).unsqueeze(1)
-                            ratios = torch.exp(logp-old_logp.detach())
-                            surr1 = ratios * advantage.detach()
-                            surr2 = torch.clamp(ratios, 1-0.2, 1+0.2) * advantage.detach()
-                            policy_loss = -torch.min(surr1, surr2)
-                            policy_loss = policy_loss.mean()
+                        logp = torch.gather(logp_list, 1, action_batch.squeeze(1)).unsqueeze(1)
+                        ratios = torch.exp(logp-old_logp.detach())
+                        surr1 = ratios * advantage.detach()
+                        surr2 = torch.clamp(ratios, 1-0.2, 1+0.2) * advantage.detach()
+                        policy_loss = -torch.min(surr1, surr2)
+                        policy_loss = policy_loss.mean()
 
-                            # value_clipped = value + (target_v_batch - value).clamp(-0.2, 0.2)
-                            # value_clipped_loss = (value_clipped-target_v_batch).pow(2)
-                            # value_loss =(value-target_v_batch).pow(2).mean()
-                            # value_loss = torch.max(value_loss, value_clipped_loss).mean()
+                        # value_clipped = value + (target_v_batch - value).clamp(-0.2, 0.2)
+                        # value_clipped_loss = (value_clipped-target_v_batch).pow(2)
+                        # value_loss =(value-target_v_batch).pow(2).mean()
+                        # value_loss = torch.max(value_loss, value_clipped_loss).mean()
 
-                            mse_loss = nn.MSELoss()
-                            value_loss = mse_loss(value, target_v_batch).mean()
+                        mse_loss = nn.MSELoss()
+                        
+                        value_loss = mse_loss(value, target_v_batch).mean()
 
-                            entropy_loss = (logp_list * logp_list.exp()).sum(dim=-1).mean()
+                        entropy_loss = (logp_list * logp_list.exp()).sum(dim=-1).mean()
 
-                            loss = policy_loss + 0.5*value_loss + 0.0*entropy_loss
-                        else:
-                            loss = 0
-                            for ga in range(len(MULTI_GAMMA)):
-                                logp = torch.gather(logp_list[:, ga], 1, action_batch.squeeze(1)).unsqueeze(1)
-                                ratios = torch.exp(logp-old_logp[:, ga].detach())
-                                surr1 = ratios * advantage[:, :, :, ga].detach()
-                                surr2 = torch.clamp(ratios, 1-0.2, 1+0.2) * advantage[:, :, :, ga].detach()
-                                policy_loss_ = -torch.min(surr1, surr2)
-                                policy_loss = policy_loss_.mean()
-
-                                mse_loss = nn.MSELoss()
-                                value_loss = mse_loss(value[:, :, ga], target_v_batch[:, :, :, ga].squeeze(-1)).mean()
-                                if SCALE_GAMMA:
-                                    value_loss = value_loss * (1-MULTI_GAMMA[ga])
-                                entropy_loss = (logp_list[:, ga] * logp_list[:, ga].exp()).sum(dim=-1).mean()
-
-                                loss = loss + policy_loss + 0.5*value_loss + 0.0*entropy_loss
-
+                        loss = policy_loss + 0.5*value_loss + 0.0*entropy_loss
                     global_optimizer.zero_grad()
                     # loss.backward()
                     scaler.scale(loss).backward()
@@ -277,7 +225,6 @@ def main():
                     # global_optimizer.step()
                     scaler.step(global_optimizer)
                     scaler.update()
-
                 lr_decay.step()
 
                 perf_data = []
@@ -308,8 +255,7 @@ def main():
                 jobList.append(meta_agent.job.remote(weights, curr_episode, BUDGET_RANGE, sample_size, SAMPLE_LENGTH))
                 curr_episode += 1 
             
-            # if curr_episode % 32 == 0:
-            if curr_episode > 10000:
+            if curr_episode % 32 == 0:
                 print('Saving model', end='\n')
                 checkpoint = {"model": global_network.state_dict(),
                               "optimizer": global_optimizer.state_dict(),
@@ -318,7 +264,6 @@ def main():
                 path_checkpoint = "./" + model_path + "/checkpoint.pth"
                 torch.save(checkpoint, path_checkpoint)
                 print('Saved model', end='\n')
-                break
                     
     
     except KeyboardInterrupt:

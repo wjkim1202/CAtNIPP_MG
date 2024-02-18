@@ -1,5 +1,5 @@
-import copy
-import os, pdb, random
+import copy, pdb
+import os
 
 import imageio
 import numpy as np
@@ -14,12 +14,12 @@ def discount(x, gamma):
 
 class Worker:
     def __init__(self, metaAgentID, localNetwork, global_step, budget_range, sample_size=SAMPLE_SIZE, sample_length=None, device='cuda', greedy=False, save_image=False):
+
         self.device = device
         self.greedy = greedy
         self.metaAgentID = metaAgentID
         self.global_step = global_step
         self.save_image = save_image
-        self.save_image = False
         self.sample_length = sample_length
         self.sample_size = sample_size
 
@@ -64,30 +64,20 @@ class Worker:
         LSTM_c = torch.zeros((1,1,EMBEDDING_DIM)).to(self.device)
 
         mask = torch.zeros((1, self.sample_size+2, K_SIZE), dtype=torch.int64).to(self.device)
-        
-        if MULTI_GAMMA is not None:
-            if FIT_GAMMA:
-                effective_gamma = 1
-                idx = np.abs(np.array(MULTI_GAMMA) - effective_gamma).argmin()
-            else:
-                idx = random.randint(0, len(MULTI_GAMMA)-1) 
-            print("---idx : ", idx)
 
+        sampled_horizon = np.random.uniform(1, 256)
+        sampled_gamma = (0.01)**sampled_horizon
         
-
         for i in range(256):
             episode_buffer[9] += LSTM_h
             episode_buffer[10] += LSTM_c
             episode_buffer[11] += mask
             episode_buffer[12] += pos_encoding
-
+            
             with torch.no_grad():
                 logp_list, value, LSTM_h, LSTM_c = self.local_net(node_inputs, edge_inputs, budget_inputs, current_index, LSTM_h, LSTM_c, pos_encoding, mask)
             # next_node (1), logp_list (1, 10), value (1,1,1)
-
-            if MULTI_GAMMA is not None:
-                logp_list = logp_list[:, idx]
-
+            pdb.set_trace()
             if self.greedy:
                 action_index = torch.argmax(logp_list, dim=1).long()
             else:
@@ -102,21 +92,12 @@ class Worker:
 
             next_node_index = edge_inputs[:, current_index.item(), action_index.item()]
             route.append(next_node_index.item())
-            reward, done, node_info, node_std, remain_budget, effective_gamma = self.env.step(next_node_index.item(), self.sample_length)
-
-            if MULTI_GAMMA is not None:
-                if FIT_GAMMA:
-                    effective_gamma = 1
-                    idx = np.abs(np.array(MULTI_GAMMA) - effective_gamma).argmin()
-                elif RANDOM_GAMMA:
-                    idx = random.randint(0, len(MULTI_GAMMA)-1) 
-                # else:
-                #     idx = random.randint(0, len(MULTI_GAMMA)-1) 
+            reward, done, node_info, node_std, remain_budget = self.env.step(next_node_index.item(), self.sample_length)
             #if (not done and i==127):
                 #reward += -np.linalg.norm(self.env.node_coords[self.env.current_node_index,:]-self.env.node_coords[0,:])
 
             episode_buffer[5] += torch.FloatTensor([[[reward]]]).to(self.device)
-            
+       
 
             current_index = next_node_index.unsqueeze(0).unsqueeze(0)
             node_info_inputs = node_info.reshape(n_nodes, 1)
@@ -127,7 +108,6 @@ class Worker:
             budget_inputs = torch.FloatTensor(budget_inputs).unsqueeze(0).to(self.device)
             #print(node_inputs)
             
-
             # mask last five node
             mask = torch.zeros((1, self.sample_size+2, K_SIZE), dtype=torch.int64).to(self.device)
             #connected_nodes = edge_inputs[0, current_index.item()]
@@ -148,11 +128,7 @@ class Worker:
 
             if done:
                 episode_buffer[6] = episode_buffer[4][1:]
-                if MULTI_GAMMA is None:
-                    episode_buffer[6].append(torch.FloatTensor([[0]]).to(self.device))
-                else:
-                    episode_buffer[6].append(torch.FloatTensor([[0]*len(MULTI_GAMMA)]).to(self.device))
-                # episode_buffer[6].append(torch.FloatTensor([[0]]).to(self.device))
+                episode_buffer[6].append(torch.FloatTensor([[0]]).to(self.device))
                 if self.env.current_node_index == 0:
                     perf_metrics['remain_budget'] = remain_budget / budget
                     #perf_metrics['collect_info'] = 1 - remain_info.sum()
@@ -173,7 +149,6 @@ class Worker:
                     perf_metrics['success_rate'] = False
                     print('{} Overbudget!'.format(i))
                 break
-        
         if not done:
             episode_buffer[6] = episode_buffer[4][1:]
             with torch.no_grad():
@@ -188,39 +163,17 @@ class Worker:
             perf_metrics['success_rate'] = False
 
         print('route is ', route)
-        if MULTI_GAMMA is None:
-            reward = copy.deepcopy(episode_buffer[5])
-            reward.append(episode_buffer[6][-1])
-            for i in range(len(reward)):
-                reward[i] = reward[i].cpu().numpy()
-            reward_plus = np.array(reward,dtype=object).reshape(-1)
+        reward = copy.deepcopy(episode_buffer[5])
+        reward.append(episode_buffer[6][-1])
+        for i in range(len(reward)):
+            reward[i] = reward[i].cpu().numpy()
+        reward_plus = np.array(reward,dtype=object).reshape(-1)
+        discounted_rewards = discount(reward_plus, GAMMA)[:-1]
+        discounted_rewards = discounted_rewards.tolist()
+        target_v = torch.FloatTensor(discounted_rewards).unsqueeze(1).unsqueeze(1).to(self.device)
 
-            discounted_rewards = discount(reward_plus, GAMMA)[:-1]
-            discounted_rewards = discounted_rewards.tolist()
-            target_v = torch.FloatTensor(discounted_rewards).unsqueeze(1).unsqueeze(1).to(self.device)
-
-            for i in range(target_v.size()[0]):
-                episode_buffer[7].append(target_v[i,:,:])
-        else:
-            target_v = []
-            for k in range(len(MULTI_GAMMA)):
-                reward = copy.deepcopy(episode_buffer[5])
-                reward.append(episode_buffer[6][-1][:, k].unsqueeze(-1))
-                for i in range(len(reward)):
-                    reward[i] = reward[i].cpu().numpy()
-
-                reward_plus = np.array(reward).reshape(-1)
-
-                discounted_rewards = discount(reward_plus, MULTI_GAMMA[k])[:-1]
-                discounted_rewards = discounted_rewards.tolist()
-                target_v_ = torch.FloatTensor(discounted_rewards).unsqueeze(1).unsqueeze(1).to(self.device)
-                target_v.append(target_v_)
-            
-            target_v = torch.stack(target_v, dim=-1)
-
-            for i in range(target_v.size()[0]):
-                episode_buffer[7].append(target_v[i,:,:])
-
+        for i in range(target_v.size()[0]):
+            episode_buffer[7].append(target_v[i,:,:])
 
         # save gif
         if self.save_image:

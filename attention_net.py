@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import math
+import math, pdb
 import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 from torch.cuda.amp.autocast_mode import autocast
@@ -220,36 +220,62 @@ class Decoder(nn.Module):
 
 
 class AttentionNet(nn.Module):
-    def __init__(self, input_dim, embedding_dim):
+    def __init__(self, input_dim, embedding_dim, multigamma=False):
+        if GAMMANET:
+            new_embedding_dim  = embedding_dim+1
+        else:
+            new_embedding_dim = embedding_dim
+
+
         super(AttentionNet, self).__init__()
         self.initial_embedding = nn.Linear(input_dim, embedding_dim) # layer for non-end position
         self.end_embedding = nn.Linear(input_dim, embedding_dim) # embedding layer for end position
-        self.budget_embedding = nn.Linear(embedding_dim+2, embedding_dim)
-        self.value_output = nn.Linear(embedding_dim,1)
+        self.budget_embedding = nn.Linear(new_embedding_dim+2, embedding_dim)
+        
         self.pos_embedding = nn.Linear(32, embedding_dim)
 
         # self.nodes_update_layers = nn.ModuleList([DecoderLayer(embedding_dim, 8) for i in range(3)])
 
         self.current_embedding = nn.Linear(embedding_dim*2, embedding_dim)
 
-        self.encoder = Encoder(embedding_dim=embedding_dim, n_head=4, n_layer=1)
+        self.encoder = Encoder(embedding_dim=new_embedding_dim, n_head=4, n_layer=1)
         self.decoder = Decoder(embedding_dim=embedding_dim, n_head=4, n_layer=1)
-        self.pointer = SingleHeadAttention(embedding_dim)
+
+        self.device = torch.device('cuda') if USE_GPU else torch.device('cpu')
+        #self.localNetwork.to(self.device)
+
+        self.multigamma = multigamma
+
+        print("########################## multi gamma ; ", self.multigamma)
+        if not multigamma:
+            self.pointer = SingleHeadAttention(embedding_dim)
+            self.value_output = nn.Linear(embedding_dim,1)
+        else:
+            #  nn.ModuleList([nn.Linear(10, 10) for _ in range(num_layers)])
+            # self.pointer = [SingleHeadAttention(embedding_dim).to(self.device) for _ in range(len(MULTI_GAMMA))]
+            self.pointer =  nn.ModuleList([SingleHeadAttention(embedding_dim) for _ in range(len(MULTI_GAMMA))])
+            # self.pointer = [SingleHeadAttention(embedding_dim).to(self.device) for _ in range(len(MULTI_GAMMA))]
+            self.value_output = nn.Linear(embedding_dim, len(MULTI_GAMMA))
 
         self.LSTM = nn.LSTM(embedding_dim, embedding_dim, batch_first=True)
 
-    def graph_embedding(self, node_inputs, edge_inputs, pos_encoding, mask=None):
+    def graph_embedding(self, node_inputs, edge_inputs, pos_encoding, mask=None, gamma=0.99):
         # current_position (batch, 1, 2)
         # end_position (batch, 1,2)
         # node_inputs (batch, sample_size+2, 2) end position and start position are the first two in the inputs
         # edge_inputs (batch, sample_size+2, k_size)
         # mask (batch, sample_size+2, k_size)
         end_position = node_inputs[:, 0, :].unsqueeze(1)
+
         embedding_feature = torch.cat(
                         (self.end_embedding(end_position), self.initial_embedding(node_inputs[:, 1:, :])), dim=1)
 
         pos_encoding = self.pos_embedding(pos_encoding)
         embedding_feature = embedding_feature + pos_encoding
+
+        gamma_feature = torch.ones_like(embedding_feature[:, :, -1]).unsqueeze(-1)*gamma
+        if GAMMANET:
+            embedding_feature = torch.cat([embedding_feature, gamma_feature], dim=-1)
 
         sample_size = embedding_feature.size()[1]
         embedding_dim = embedding_feature.size()[2]
@@ -288,13 +314,16 @@ class AttentionNet(nn.Module):
         current_edge = torch.gather(edge_inputs, 1, current_index.repeat(1, 1, k_size))
         # print(current_edge)
         current_edge = current_edge.permute(0, 2, 1)
-        embedding_dim = embedding_feature.size()[2]
+        # embedding_dim = embedding_feature.size()[2]
 
         th = torch.FloatTensor([ADAPTIVE_TH]).unsqueeze(0).unsqueeze(0).repeat(batch_size, sample_size, 1).to(embedding_feature.device)
 
         embedding_feature = self.budget_embedding(torch.cat((embedding_feature, budget_inputs, th), dim=-1))
+
+        embedding_dim = embedding_feature.size()[2]
+
+
         connected_nodes_feature = torch.gather(embedding_feature, 1, current_edge.repeat(1, 1, embedding_dim))
-        
         connected_nodes_budget = torch.gather(budget_inputs, 1, current_edge)
         # print(embedding_feature)
         # print(connected_nodes_feature)
@@ -320,18 +349,28 @@ class AttentionNet(nn.Module):
         
         # connected_nodes_feature = self.encoder(connected_nodes_feature, current_mask)
         current_feature_prime = self.decoder(current_node_feature, connected_nodes_feature, current_mask)
-        logp_list = self.pointer(current_feature_prime, connected_nodes_feature, current_mask)
-        logp_list = logp_list.squeeze(1)
-        value = self.value_output(current_feature_prime)
+        if not self.multigamma:
+            logp_list = self.pointer(current_feature_prime, connected_nodes_feature, current_mask)
+            logp_list = logp_list.squeeze(1)
+            value = self.value_output(current_feature_prime)
+        else:
+            logp_list = []
+            for j in range(len(MULTI_GAMMA)):
+                logp_list_ = self.pointer[j](current_feature_prime, connected_nodes_feature, current_mask)
+                logp_list_ = logp_list_.squeeze(1)
+                logp_list.append(logp_list_)
+            
+            logp_list = torch.stack(logp_list, dim=1)
+            value = self.value_output(current_feature_prime)
 
         LSTM_h = LSTM_h.permute(1,0,2)
         LSTM_c = LSTM_c.permute(1,0,2)
 
         return logp_list, value, LSTM_h, LSTM_c
 
-    def forward(self, node_inputs, edge_inputs, budget_inputs, current_index, LSTM_h, LSTM_c, pos_encoding, mask=None):
+    def forward(self, node_inputs, edge_inputs, budget_inputs, current_index, LSTM_h, LSTM_c, pos_encoding, mask=None, gamma=1):
         with autocast():
-            embedding_feature = self.graph_embedding(node_inputs, edge_inputs, pos_encoding, mask=None)
+            embedding_feature = self.graph_embedding(node_inputs, edge_inputs, pos_encoding, mask=None, gamma=gamma)
             logp_list, value, LSTM_h, LSTM_c = self.select_next_node(embedding_feature, edge_inputs, budget_inputs, current_index, LSTM_h, LSTM_c, mask)
         return logp_list, value, LSTM_h, LSTM_c
 

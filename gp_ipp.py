@@ -7,7 +7,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, Matern, ConstantKernel as C
 from classes.Gaussian2D import Gaussian2D
 from parameters import *
-
+import pdb
 
 class GaussianProcessForIPP():
     def __init__(self, node_coords):
@@ -51,13 +51,15 @@ class GaussianProcessForIPP():
         score = self.gp.score(x1x2,y_true)
         return score
 
-    def evaluate_cov_trace(self, X=None):
+    def evaluate_cov_trace(self, X=None, ver=0):
         if X is None:
             x1 = np.linspace(0, 1, 30)
             x2 = np.linspace(0, 1, 30)
             X = np.array(list(product(x1, x2)))
         _, std = self.gp.predict(X, return_std=True)
         trace = np.sum(std*std)
+        if ver == 1:
+            return trace, std
         return trace
 
     def evaluate_mutual_info(self, X=None):
@@ -69,6 +71,7 @@ class GaussianProcessForIPP():
         _, cov = self.gp.predict(X, return_cov=True)
         
         mi = (1 / 2) * np.log(np.linalg.det(0.01*cov.reshape(n_sample, n_sample) + np.identity(n_sample)))
+        
         return mi
 
     def get_high_info_area(self, t=ADAPTIVE_TH, beta=1):
@@ -85,6 +88,8 @@ class GaussianProcessForIPP():
         return high_measurement_area
 
     def plot(self, y_true):
+        print("##plot ")
+        pdb.set_trace()
         x1 = np.linspace(0, 1, 30)
         x2 = np.linspace(0, 1, 30)
 
